@@ -16,7 +16,7 @@ A lot of these examples follow the classic "Allocate-Inject-Execute" pattern. So
 ### CreateRemoteThread
 
 
-### Process Hollowing
+### Process Hollowing (64-bit)
 
 ### QueueUserApc
 
